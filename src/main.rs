@@ -5,9 +5,11 @@ use fern::colors::{Color, ColoredLevelConfig};
 
 use log::{debug, error, info, warn};
 use std::{
+    collections::HashMap,
     env,
     ffi::OsStr,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 use walkdir::WalkDir;
@@ -110,6 +112,28 @@ fn find_cargo_projects(root: &Path, include_hidden: bool) -> Vec<PathBuf> {
     target_paths.into_iter().collect()
 }
 
+/// Run `direnv export json` in the given directory and extract CARGO_TARGET_DIR if set.
+fn get_direnv_target_dir(dir: &Path) -> Option<String> {
+    let output = Command::new("direnv")
+        .arg("export")
+        .arg("json")
+        .current_dir(dir)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    if stdout.trim().is_empty() {
+        return None;
+    }
+
+    let env_vars: HashMap<String, String> = serde_json::from_str(&stdout).ok()?;
+    env_vars.get("CARGO_TARGET_DIR").cloned()
+}
+
 fn metadata(path: &Path) -> Result<Metadata, Error> {
     let manifest_path = if path.file_name().and_then(OsStr::to_str) == Some("Cargo.toml") {
         path.to_owned()
@@ -117,10 +141,31 @@ fn metadata(path: &Path) -> Result<Metadata, Error> {
         path.join("Cargo.toml")
     };
 
-    MetadataCommand::new()
+    let project_dir = manifest_path.parent().unwrap_or(path);
+    let direnv_target = get_direnv_target_dir(project_dir);
+
+    // Temporarily set CARGO_TARGET_DIR if direnv provides one
+    let old_target_dir = direnv_target.as_ref().map(|target_dir| {
+        debug!("Using CARGO_TARGET_DIR from direnv: {}", target_dir);
+        let old = env::var("CARGO_TARGET_DIR").ok();
+        env::set_var("CARGO_TARGET_DIR", target_dir);
+        old
+    });
+
+    let result = MetadataCommand::new()
         .manifest_path(manifest_path)
         .no_deps()
-        .exec()
+        .exec();
+
+    // Restore previous CARGO_TARGET_DIR
+    if let Some(old) = old_target_dir {
+        match old {
+            Some(v) => env::set_var("CARGO_TARGET_DIR", v),
+            None => env::remove_var("CARGO_TARGET_DIR"),
+        }
+    }
+
+    result
 }
 
 fn main() -> anyhow::Result<()> {
