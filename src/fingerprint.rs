@@ -287,6 +287,60 @@ fn remove_not_built_with_in_a_profile(
     Ok(total_disk_space)
 }
 
+/// Returns the most recent mtime of any file within a directory.
+fn newest_mtime_in_dir(dir: &Path) -> Result<Duration, Error> {
+    let mut newest = Duration::MAX;
+    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            let elapsed = entry
+                .metadata()?
+                .modified()?
+                .elapsed()
+                .unwrap_or(Duration::from_secs(0));
+            if elapsed < newest {
+                newest = elapsed;
+            }
+        }
+    }
+    Ok(newest)
+}
+
+fn remove_older_incremental_in_a_profile(
+    dir: &Path,
+    keep_duration: &Duration,
+    dry_run: bool,
+) -> Result<u64, Error> {
+    let incremental_dir = dir.join("incremental");
+    if !incremental_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut total_disk_space = 0;
+    for entry in fs::read_dir(&incremental_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let elapsed = newest_mtime_in_dir(&path)?;
+
+        if elapsed >= *keep_duration {
+            let size = total_disk_space_dir(&path);
+            total_disk_space += size;
+            if !dry_run {
+                match remove_dir_all(&path) {
+                    Ok(_) => debug!("Successfully removed: {:?}", &path),
+                    Err(e) => warn!("Failed to remove: {:?} {}", &path, e),
+                };
+            } else {
+                debug!("Would remove: {:?}", &path);
+            }
+        }
+    }
+    Ok(total_disk_space)
+}
+
 fn lookup_all_fingerprint_dirs(dir: &Path) -> impl Iterator<Item = DirEntry> {
     WalkDir::new(dir)
         .min_depth(1)
@@ -469,8 +523,10 @@ pub fn remove_older_than(
     for fing in lookup_all_fingerprint_dirs(path) {
         let path = fing.into_path();
         let keep = load_all_fingerprints_newer_than(&path, keep_duration)?;
+        let profile_dir = path.parent().unwrap();
+        total_disk_space += remove_not_built_with_in_a_profile(profile_dir, &keep, dry_run)?;
         total_disk_space +=
-            remove_not_built_with_in_a_profile(path.parent().unwrap(), &keep, dry_run)?;
+            remove_older_incremental_in_a_profile(profile_dir, keep_duration, dry_run)?;
     }
 
     Ok(total_disk_space)
